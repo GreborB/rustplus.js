@@ -14,6 +14,7 @@ class RustPlus extends EventEmitter {
      * @param playerId SteamId of the Player
      * @param playerToken Player Token from Server Pairing
      * @param useFacepunchProxy True to use secure websocket via Facepunch's proxy, or false to directly connect to Rust Server
+     * @param wsOptions Optional options object to pass to the underlying WebSocket constructor (e.g., for TLS settings)
      *
      * Events emitted by the RustPlus class instance
      * - connecting: When we are connecting to the Rust Server.
@@ -23,7 +24,7 @@ class RustPlus extends EventEmitter {
      * - disconnected: When we are disconnected from the Rust Server.
      * - error: When something goes wrong.
      */
-    constructor(server, port, playerId, playerToken, useFacepunchProxy = false) {
+    constructor(server, port, playerId, playerToken, useFacepunchProxy = false, wsOptions = {}) { // Added wsOptions parameter
 
         super();
 
@@ -32,6 +33,7 @@ class RustPlus extends EventEmitter {
         this.playerId = playerId;
         this.playerToken = playerToken;
         this.useFacepunchProxy = useFacepunchProxy;
+        this.wsOptions = wsOptions; // Store the options
 
         this.seq = 0;
         this.seqCallbacks = [];
@@ -60,7 +62,7 @@ class RustPlus extends EventEmitter {
 
             // connect to websocket
             var address = this.useFacepunchProxy ? `wss://companion-rust.facepunch.com/game/${this.server}/${this.port}` : `wss://${this.server}:${this.port}`;
-            this.websocket = new WebSocket(address);
+            this.websocket = new WebSocket(address, this.wsOptions); // Pass the wsOptions here
 
             // fire event when connected
             this.websocket.on('open', () => {
@@ -125,8 +127,10 @@ class RustPlus extends EventEmitter {
      * @returns {boolean}
      */
     isConnected() {
-        return (this.websocket.readyState === WebSocket.OPEN);
+        // Ensure websocket exists before checking readyState
+        return this.websocket && (this.websocket.readyState === WebSocket.OPEN);
     }
+
 
     /**
      * Send a Request to the Rust Server with an optional callback when a Response is received.
@@ -134,6 +138,14 @@ class RustPlus extends EventEmitter {
      * @param callback
      */
     sendRequest(data, callback) {
+        // Ensure websocket is ready before sending
+        if (!this.isConnected()) {
+            // Handle the error appropriately, e.g., emit an error or reject a promise if part of an async operation
+            console.error("Attempted to send request while not connected.");
+            // Optionally, you could try to queue the request or throw an error
+            // For now, let's just prevent sending on a non-open socket
+            return;
+        }
 
         // increment sequence number
         let currentSeq = ++this.seq;
@@ -152,11 +164,21 @@ class RustPlus extends EventEmitter {
         });
 
         // send AppRequest packet to rust server
-        this.websocket.send(this.AppRequest.encode(request).finish());
-
-        // fire event when request has been sent, this is useful for logging
-        this.emit('request', request);
-
+        try {
+            this.websocket.send(this.AppRequest.encode(request).finish());
+             // fire event when request has been sent, this is useful for logging
+            this.emit('request', request);
+        } catch (sendError) {
+            console.error("Error sending WebSocket message:", sendError);
+             // Handle the error, perhaps emit an error event
+            this.emit('error', new Error(`Failed to send request: ${sendError.message}`));
+             // If this request had a callback, maybe call it with an error?
+             // Or remove the callback if appropriate
+             if (callback) {
+                 delete this.seqCallbacks[currentSeq];
+                 // Consider calling callback with an error object or similar
+             }
+        }
     }
 
     /**
@@ -166,34 +188,55 @@ class RustPlus extends EventEmitter {
      */
     sendRequestAsync(data, timeoutMilliseconds = 10000) {
         return new Promise((resolve, reject) => {
+             // Check connection status before attempting to send
+             if (!this.isConnected()) {
+                reject(new Error('Not connected to Rust server.'));
+                return;
+             }
 
             // reject promise after timeout
             var timeout = setTimeout(() => {
+                 // Ensure the callback for this sequence is cleaned up on timeout
+                 if (this.seqCallbacks[currentSeq]) {
+                     delete this.seqCallbacks[currentSeq];
+                 }
                 reject(new Error('Timeout reached while waiting for response'));
             }, timeoutMilliseconds);
 
+             // Need to capture the sequence number *before* calling sendRequest
+             let currentSeq; // Declare here
+
             // send request
-            this.sendRequest(data, (message) => {
+            try {
+                 // Assign seq inside sendRequest logic and capture it
+                this.sendRequest(data, (message) => {
 
-                // cancel timeout
-                clearTimeout(timeout);
+                    // cancel timeout
+                    clearTimeout(timeout);
+                     // Callback already removed by sendRequest on response
 
-                if(message.response.error){
+                    if(message.response.error){
 
-                    // reject promise if server returns an AppError for this request
-                    reject(message.response.error);
+                        // reject promise if server returns an AppError for this request
+                        reject(message.response.error);
 
-                } else {
+                    } else {
 
-                    // request was successful, resolve with message.response
-                    resolve(message.response);
+                        // request was successful, resolve with message.response
+                        resolve(message.response);
 
-                }
-
-            });
-
+                    }
+                 });
+                 // Get the sequence number assigned by the *synchronous* part of sendRequest
+                 currentSeq = this.seq;
+            } catch (error) {
+                 // Catch synchronous errors from sendRequest itself (like not being connected)
+                clearTimeout(timeout); // Clean up timer
+                reject(error);
+            }
         });
     }
+
 
     /**
      * Send a Request to the Rust Server to set the Entity Value.
@@ -277,7 +320,7 @@ class RustPlus extends EventEmitter {
             },
         }, callback);
     }
-    
+
     /**
      * Get the ingame time
     */
