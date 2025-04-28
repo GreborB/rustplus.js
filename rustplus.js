@@ -59,7 +59,7 @@ class RustPlus extends EventEmitter {
             this.emit('connecting');
 
             // connect to websocket
-            var address = this.useFacepunchProxy ? `wss://companion-rust.facepunch.com/game/${this.server}/${this.port}` : `ws://${this.server}:${this.port}`;
+            var address = this.useFacepunchProxy ? `wss://companion-rust.facepunch.com/game/${this.server}/${this.port}` : `wss://${this.server}:${this.port}`;
             this.websocket = new WebSocket(address);
 
             // fire event when connected
