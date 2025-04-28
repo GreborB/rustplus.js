@@ -18,7 +18,7 @@ class RustPlus extends EventEmitter {
      *
      * Events emitted by the RustPlus class instance
      * - connecting: When we are connecting to the Rust Server.
-     * - connected: When we are connected to the Rust Server.
+     * - connected: When we are connected to the Rust Server (after successful initial getInfo).
      * - message: When an AppMessage has been received from the Rust Server.
      * - request: When an AppRequest has been sent to the Rust Server.
      * - disconnected: When we are disconnected from the Rust Server.
@@ -64,50 +64,90 @@ class RustPlus extends EventEmitter {
             var address = this.useFacepunchProxy ? `wss://companion-rust.facepunch.com/game/${this.server}/${this.port}` : `wss://${this.server}:${this.port}`;
             this.websocket = new WebSocket(address, this.wsOptions); // Pass the wsOptions here
 
-            // fire event when connected
+            // WebSocket 'open' event handler - MODIFIED LOGIC
             this.websocket.on('open', () => {
-                this.emit('connected');
+                // Try sending an initial request immediately after open
+                // Use console.log for temporary debugging within the library file itself
+                console.log(`[RustPlus Fork - ${new Date().toISOString()}] WebSocket opened. Sending initial getInfo request...`);
+                this.getInfo((message) => {
+                    // This callback will be invoked when the getInfo response arrives
+                    console.log(`[RustPlus Fork - ${new Date().toISOString()}] Received response to initial getInfo:`, JSON.stringify(message));
+
+                    // Check if the response indicates success before emitting 'connected'
+                    if (message && message.response && !message.response.error) {
+                        console.log(`[RustPlus Fork - ${new Date().toISOString()}] Initial getInfo successful. Emitting 'connected'.`);
+                        this.emit('connected'); // Emit connected ONLY after successful initial request
+                    } else {
+                        const errorMsg = message?.response?.error?.error || 'Unknown error during initial getInfo';
+                        console.error(`[RustPlus Fork - ${new Date().toISOString()}] Initial getInfo failed or returned error. Disconnecting. Error:`, errorMsg);
+                        this.emit('error', new Error(`Initial getInfo failed: ${errorMsg}`));
+                        this.disconnect(); // Disconnect on failure
+                    }
+                    return true; // Mark this specific callback as handled (prevents 'message' event for this)
+                });
+
+                // We no longer emit 'connected' immediately here.
+                // It will be emitted inside the getInfo callback upon success.
             });
 
             // fire event for websocket errors
             this.websocket.on('error', (e) => {
+                console.error(`[RustPlus Fork - ${new Date().toISOString()}] WebSocket error event:`, e.message); // Log error clearly
                 this.emit('error', e);
+                // Consider disconnecting or cleaning up state here if appropriate
+                // this.disconnect(); // Maybe disconnect on any WS error?
             });
 
+            // Handle incoming messages (excluding the handled getInfo response)
             this.websocket.on('message', (data) => {
+                try {
+                    // decode received message
+                    var message = this.AppMessage.decode(data);
 
-                // decode received message
-                var message = this.AppMessage.decode(data);
+                    // check if received message is a response and if we have a callback registered for it
+                    if (message.response && message.response.seq && this.seqCallbacks[message.response.seq]) {
 
-                // check if received message is a response and if we have a callback registered for it
-                if(message.response && message.response.seq && this.seqCallbacks[message.response.seq]){
+                        // get the callback for the response sequence
+                        var callback = this.seqCallbacks[message.response.seq];
 
-                    // get the callback for the response sequence
-                    var callback = this.seqCallbacks[message.response.seq];
+                        // remove the callback *before* calling it to prevent potential re-entrancy issues
+                        delete this.seqCallbacks[message.response.seq];
 
-                    // call the callback with the response message
-                    var result = callback(message);
+                        // call the callback with the response message
+                        var result = callback(message);
 
-                    // remove the callback
-                    delete this.seqCallbacks[message.response.seq];
 
-                    // if callback returns true, don't fire message event
-                    if(result){
-                        return;
+                        // if callback returns true, don't fire global 'message' event
+                        if (result) {
+                            return;
+                        }
+
                     }
 
-                }
+                    // fire message event for received messages that aren't handled by callback
+                    // or aren't responses (i.e., broadcasts)
+                    this.emit('message', message);
 
-                // fire message event for received messages that aren't handled by callback
-                this.emit('message', this.AppMessage.decode(data));
+                } catch (decodeError) {
+                     console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error decoding protobuf message:`, decodeError);
+                     this.emit('error', new Error(`Protobuf decode error: ${decodeError.message}`));
+                }
 
             });
 
             // fire event when disconnected
-            this.websocket.on('close', () => {
+            this.websocket.on('close', (code, reason) => {
+                console.log(`[RustPlus Fork - ${new Date().toISOString()}] WebSocket closed. Code: ${code}, Reason: ${reason}`); // Log close details
                 this.emit('disconnected');
+                 // Clean up callbacks map on close
+                 this.seqCallbacks = [];
             });
 
+        }).catch(protoLoadError => {
+             // Handle errors loading the protobuf file
+            console.error(`[RustPlus Fork - ${new Date().toISOString()}] Fatal Error: Failed to load rustplus.proto:`, protoLoadError);
+            // Emit an error that the main application can catch
+            this.emit('error', new Error(`Failed to load protobuf definition: ${protoLoadError.message}`));
         });
 
     }
@@ -117,8 +157,11 @@ class RustPlus extends EventEmitter {
      */
     disconnect() {
         if(this.websocket){
-            this.websocket.terminate();
-            this.websocket = null;
+            console.log(`[RustPlus Fork - ${new Date().toISOString()}] Disconnect called. Terminating WebSocket.`); // Log disconnect call
+            this.websocket.terminate(); // Force close the connection
+            this.websocket = null; // Nullify the reference
+             // Clean up callbacks map on explicit disconnect
+             this.seqCallbacks = [];
         }
     }
 
@@ -135,16 +178,25 @@ class RustPlus extends EventEmitter {
     /**
      * Send a Request to the Rust Server with an optional callback when a Response is received.
      * @param data this should contain valid data for the AppRequest packet in the rustplus.proto schema file
-     * @param callback
+     * @param callback Optional callback for the response
      */
     sendRequest(data, callback) {
         // Ensure websocket is ready before sending
         if (!this.isConnected()) {
-            // Handle the error appropriately, e.g., emit an error or reject a promise if part of an async operation
-            console.error("Attempted to send request while not connected.");
-            // Optionally, you could try to queue the request or throw an error
-            // For now, let's just prevent sending on a non-open socket
-            return;
+            const errorMsg = "Attempted to send request while not connected.";
+            console.error(`[RustPlus Fork - ${new Date().toISOString()}] ${errorMsg}`);
+            // If a callback was provided, call it immediately with an error?
+             if (callback) {
+                 // Simulate an error response structure if possible, or just pass an Error
+                 try {
+                     callback({ response: { error: { error: 'disconnected' } } });
+                 } catch (cbError) {
+                     console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error invoking callback during disconnected sendRequest:`, cbError);
+                 }
+             }
+            // Emit a general error as well
+            this.emit('error', new Error(errorMsg));
+            return; // Stop processing
         }
 
         // increment sequence number
@@ -156,25 +208,36 @@ class RustPlus extends EventEmitter {
         }
 
         // create protobuf from AppRequest packet
-        let request = this.AppRequest.fromObject({
-            seq: currentSeq,
-            playerId: this.playerId,
-            playerToken: this.playerToken,
-            ...data, // merge in provided data for AppRequest
-        });
+        let requestPayload;
+        try {
+            requestPayload = this.AppRequest.fromObject({
+                seq: currentSeq,
+                playerId: this.playerId,
+                playerToken: this.playerToken,
+                ...data, // merge in provided data for AppRequest
+            });
+        } catch (objectError) {
+            console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error creating protobuf object:`, objectError, "Data:", data);
+            this.emit('error', new Error(`Protobuf object creation error: ${objectError.message}`));
+            if (callback) delete this.seqCallbacks[currentSeq]; // Clean up callback
+            return;
+        }
+
 
         // send AppRequest packet to rust server
         try {
-            this.websocket.send(this.AppRequest.encode(request).finish());
+            const buffer = this.AppRequest.encode(requestPayload).finish();
+            this.websocket.send(buffer);
              // fire event when request has been sent, this is useful for logging
-            this.emit('request', request);
+             // console.log(`[RustPlus Fork - ${new Date().toISOString()}] Sent request seq ${currentSeq}:`, JSON.stringify(requestPayload)); // Optional: Log sent request
+            this.emit('request', requestPayload);
         } catch (sendError) {
-            console.error("Error sending WebSocket message:", sendError);
-             // Handle the error, perhaps emit an error event
+            console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error sending WebSocket message seq ${currentSeq}:`, sendError);
+            // Handle the error, perhaps emit an error event
             this.emit('error', new Error(`Failed to send request: ${sendError.message}`));
              // If this request had a callback, maybe call it with an error?
              // Or remove the callback if appropriate
-             if (callback) {
+             if (this.seqCallbacks[currentSeq]) {
                  delete this.seqCallbacks[currentSeq];
                  // Consider calling callback with an error object or similar
              }
@@ -194,46 +257,62 @@ class RustPlus extends EventEmitter {
                 return;
              }
 
-            // reject promise after timeout
-            var timeout = setTimeout(() => {
+             // Need to capture the sequence number *before* setting the timeout or sending
+             const currentSeq = ++this.seq;
+             let timeout = null; // Declare timeout variable
+
+             // Setup the callback first
+             this.seqCallbacks[currentSeq] = (message) => {
+                 clearTimeout(timeout); // Clear timeout on response
+                 // Callback removed by sendRequest logic after this runs or on timeout cleanup
+                 if (message.response.error) {
+                     reject(message.response.error);
+                 } else {
+                     resolve(message.response);
+                 }
+                 return true; // Mark as handled
+             };
+
+             // Setup the timeout
+             timeout = setTimeout(() => {
                  // Ensure the callback for this sequence is cleaned up on timeout
                  if (this.seqCallbacks[currentSeq]) {
                      delete this.seqCallbacks[currentSeq];
                  }
-                reject(new Error('Timeout reached while waiting for response'));
+                reject(new Error(`Timeout reached while waiting for response to seq ${currentSeq}`));
             }, timeoutMilliseconds);
 
-             // Need to capture the sequence number *before* calling sendRequest
-             let currentSeq; // Declare here
-
-            // send request
+            // Now actually send the request (using the manually incremented seq)
+            // Create protobuf from AppRequest packet (adjust internal seq handling)
+            let requestPayload;
             try {
-                 // Assign seq inside sendRequest logic and capture it
-                this.sendRequest(data, (message) => {
-
-                    // cancel timeout
-                    clearTimeout(timeout);
-                     // Callback already removed by sendRequest on response
-
-                    if(message.response.error){
-
-                        // reject promise if server returns an AppError for this request
-                        reject(message.response.error);
-
-                    } else {
-
-                        // request was successful, resolve with message.response
-                        resolve(message.response);
-
-                    }
-                 });
-                 // Get the sequence number assigned by the *synchronous* part of sendRequest
-                 currentSeq = this.seq;
-            } catch (error) {
-                 // Catch synchronous errors from sendRequest itself (like not being connected)
-                clearTimeout(timeout); // Clean up timer
-                reject(error);
+                 requestPayload = this.AppRequest.fromObject({
+                    seq: currentSeq, // Use the captured sequence
+                    playerId: this.playerId,
+                    playerToken: this.playerToken,
+                    ...data,
+                });
+            } catch (objectError) {
+                console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error creating protobuf object for async req:`, objectError, "Data:", data);
+                 clearTimeout(timeout); // Clean up timer
+                if (this.seqCallbacks[currentSeq]) delete this.seqCallbacks[currentSeq]; // Clean up callback
+                reject(new Error(`Protobuf object creation error: ${objectError.message}`));
+                return;
             }
+
+             // Send AppRequest packet
+             try {
+                 const buffer = this.AppRequest.encode(requestPayload).finish();
+                 this.websocket.send(buffer);
+                  // console.log(`[RustPlus Fork - ${new Date().toISOString()}] Sent async request seq ${currentSeq}:`, JSON.stringify(requestPayload)); // Optional log
+                 this.emit('request', requestPayload);
+             } catch (sendError) {
+                 console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error sending async WebSocket message seq ${currentSeq}:`, sendError);
+                 clearTimeout(timeout); // Clean up timer
+                if (this.seqCallbacks[currentSeq]) delete this.seqCallbacks[currentSeq]; // Clean up callback
+                 this.emit('error', new Error(`Failed to send async request: ${sendError.message}`));
+                 reject(sendError); // Reject the promise
+             }
         });
     }
 
@@ -279,7 +358,10 @@ class RustPlus extends EventEmitter {
     strobe(entityId, timeoutMilliseconds = 100, value = true) {
         this.setEntityValue(entityId, value);
         setTimeout(() => {
-            this.strobe(entityId, timeoutMilliseconds, !value);
+            // Check if connected before strobing again
+            if (this.isConnected()) {
+                 this.strobe(entityId, timeoutMilliseconds, !value);
+            }
         }, timeoutMilliseconds);
     }
 
