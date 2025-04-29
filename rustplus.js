@@ -4,7 +4,7 @@ const path = require('path');
 const WebSocket = require('ws');
 const protobuf = require("protobufjs");
 const { EventEmitter } = require('events');
-const Camera = require('./camera');
+const Camera = require('./camera'); // Assuming camera.js is also in the fork
 
 class RustPlus extends EventEmitter {
 
@@ -14,17 +14,16 @@ class RustPlus extends EventEmitter {
      * @param playerId SteamId of the Player
      * @param playerToken Player Token from Server Pairing
      * @param useFacepunchProxy True to use secure websocket via Facepunch's proxy, or false to directly connect to Rust Server
-     * @param wsOptions Optional options object to pass to the underlying WebSocket constructor (e.g., for TLS settings)
      *
      * Events emitted by the RustPlus class instance
      * - connecting: When we are connecting to the Rust Server.
-     * - connected: When we are connected to the Rust Server (after successful initial getInfo).
+     * - connected: When we are connected to the Rust Server.
      * - message: When an AppMessage has been received from the Rust Server.
      * - request: When an AppRequest has been sent to the Rust Server.
      * - disconnected: When we are disconnected from the Rust Server.
      * - error: When something goes wrong.
      */
-    constructor(server, port, playerId, playerToken, useFacepunchProxy = false, wsOptions = {}) { // Added wsOptions parameter
+    constructor(server, port, playerId, playerToken, useFacepunchProxy = false) {
 
         super();
 
@@ -32,25 +31,43 @@ class RustPlus extends EventEmitter {
         this.port = port;
         this.playerId = playerId;
         this.playerToken = playerToken;
-        this.useFacepunchProxy = useFacepunchProxy;
-        this.wsOptions = wsOptions; // Store the options
+        this.useFacepunchProxy = useFacepunchProxy; // This can be overridden by the service later
 
         this.seq = 0;
         this.seqCallbacks = [];
+        this.websocket = null; // Initialize websocket to null
 
     }
 
     /**
-     * This sets everything up and then connects to the Rust Server via WebSocket.
+     * Connect to the Rust Server.
+     * @param {string[]} [protocols] Optional WebSocket protocols.
+     * @param {object} [options] Optional WebSocket constructor options.
      */
-    connect() {
+    connect(protocols, options) {
 
-        // load protobuf then connect
-        protobuf.load(path.resolve(__dirname, "rustplus.proto")).then((root) => {
+        // check if we are already connected or connecting
+        if(this.websocket && (this.websocket.readyState === WebSocket.CONNECTING || this.websocket.readyState === WebSocket.OPEN)){
+            console.log("INTERNAL: WebSocket connection attempt skipped, already connecting or connected.");
+            // Optionally disconnect the existing one if behaviour requires replacing
+            // this.disconnect();
+            return; // Don't attempt a new connection if one is active/pending
+        }
 
-            // make sure existing connection is disconnected before connecting again.
-            if(this.websocket){
-                this.disconnect();
+        // If websocket exists but is closed/closing, ensure it's cleaned up before reconnecting
+        if (this.websocket) {
+             console.log("INTERNAL: Cleaning up previous closed/closing WebSocket instance.");
+             this.websocket.terminate();
+             this.websocket = null;
+        }
+
+
+        protobuf.load(path.join(__dirname, 'rustplus.proto'), (err, root) => {
+
+            // handle errors loading protobuf schema
+            if (err) {
+                this.emit('error', err);
+                return;
             }
 
             // load proto types
@@ -62,94 +79,86 @@ class RustPlus extends EventEmitter {
 
             // connect to websocket
             var address = this.useFacepunchProxy ? `wss://companion-rust.facepunch.com/game/${this.server}/${this.port}` : `wss://${this.server}:${this.port}`;
-            this.websocket = new WebSocket(address, this.wsOptions); // Pass the wsOptions here
+            console.log(`INTERNAL: Attempting WebSocket connection to: ${address}`); // Added for debugging
 
-            // WebSocket 'open' event handler - MODIFIED LOGIC
-            this.websocket.on('open', () => {
-                // Try sending an initial request immediately after open
-                // Use console.log for temporary debugging within the library file itself
-                console.log(`[RustPlus Fork - ${new Date().toISOString()}] WebSocket opened. Sending initial getInfo request...`);
-                this.getInfo((message) => {
-                    // This callback will be invoked when the getInfo response arrives
-                    console.log(`[RustPlus Fork - ${new Date().toISOString()}] Received response to initial getInfo:`, JSON.stringify(message));
+            try {
+                // Pass protocols and options if provided
+                this.websocket = new WebSocket(address, protocols, options);
+            } catch (wsError) {
+                console.error("INTERNAL: Error creating WebSocket instance:", wsError);
+                this.emit('error', wsError);
+                this.websocket = null; // Ensure websocket is null on constructor error
+                return;
+            }
 
-                    // Check if the response indicates success before emitting 'connected'
-                    if (message && message.response && !message.response.error) {
-                        console.log(`[RustPlus Fork - ${new Date().toISOString()}] Initial getInfo successful. Emitting 'connected'.`);
-                        this.emit('connected'); // Emit connected ONLY after successful initial request
-                    } else {
-                        const errorMsg = message?.response?.error?.error || 'Unknown error during initial getInfo';
-                        console.error(`[RustPlus Fork - ${new Date().toISOString()}] Initial getInfo failed or returned error. Disconnecting. Error:`, errorMsg);
-                        this.emit('error', new Error(`Initial getInfo failed: ${errorMsg}`));
-                        this.disconnect(); // Disconnect on failure
-                    }
-                    return true; // Mark this specific callback as handled (prevents 'message' event for this)
-                });
-
-                // We no longer emit 'connected' immediately here.
-                // It will be emitted inside the getInfo callback upon success.
-            });
+            // Check readyState immediately in case 'open' fired before listener attached
+            if (this.websocket.readyState === WebSocket.OPEN) {
+                console.log("INTERNAL: WebSocket already open on creation.");
+                this._handleOpen();
+            } else {
+                 // Attach listeners only if not already open
+                 this.websocket.on('open', () => this._handleOpen());
+            }
 
             // fire event for websocket errors
             this.websocket.on('error', (e) => {
-                console.error(`[RustPlus Fork - ${new Date().toISOString()}] WebSocket error event:`, e.message); // Log error clearly
+                console.error("INTERNAL: WebSocket 'error' event:", e.message);
                 this.emit('error', e);
-                // Consider disconnecting or cleaning up state here if appropriate
-                // this.disconnect(); // Maybe disconnect on any WS error?
+                // Consider cleanup here? Depends on whether 'close' always follows 'error'
+                // this.websocket = null;
             });
 
-            // Handle incoming messages (excluding the handled getInfo response)
             this.websocket.on('message', (data) => {
-                try {
-                    // decode received message
-                    var message = this.AppMessage.decode(data);
 
-                    // check if received message is a response and if we have a callback registered for it
-                    if (message.response && message.response.seq && this.seqCallbacks[message.response.seq]) {
+                // decode received message
+                var message = this.AppMessage.decode(data);
 
-                        // get the callback for the response sequence
-                        var callback = this.seqCallbacks[message.response.seq];
+                // check if received message is a response and if we have a callback registered for it
+                if(message.response && message.response.seq && this.seqCallbacks[message.response.seq]){
 
-                        // remove the callback *before* calling it to prevent potential re-entrancy issues
-                        delete this.seqCallbacks[message.response.seq];
+                    // get the callback for the response sequence
+                    var callback = this.seqCallbacks[message.response.seq];
 
-                        // call the callback with the response message
-                        var result = callback(message);
+                    // call the callback with the response message
+                    var result = callback(message);
 
+                    // remove the callback
+                    delete this.seqCallbacks[message.response.seq];
 
-                        // if callback returns true, don't fire global 'message' event
-                        if (result) {
-                            return;
-                        }
-
+                    // if callback returns true, don't fire message event
+                    if(result){
+                        return;
                     }
 
-                    // fire message event for received messages that aren't handled by callback
-                    // or aren't responses (i.e., broadcasts)
-                    this.emit('message', message);
-
-                } catch (decodeError) {
-                     console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error decoding protobuf message:`, decodeError);
-                     this.emit('error', new Error(`Protobuf decode error: ${decodeError.message}`));
                 }
+
+                // fire message event for received messages that aren't handled by callback
+                this.emit('message', this.AppMessage.decode(data));
 
             });
 
             // fire event when disconnected
             this.websocket.on('close', (code, reason) => {
-                console.log(`[RustPlus Fork - ${new Date().toISOString()}] WebSocket closed. Code: ${code}, Reason: ${reason}`); // Log close details
+                console.log(`INTERNAL: WebSocket 'close' event. Code: ${code}, Reason: ${reason}`);
+                // Clear potentially dangling callbacks on disconnect
+                this.seqCallbacks = [];
+                this.websocket = null; // Clear the instance on close
                 this.emit('disconnected');
-                 // Clean up callbacks map on close
-                 this.seqCallbacks = [];
             });
 
-        }).catch(protoLoadError => {
-             // Handle errors loading the protobuf file
-            console.error(`[RustPlus Fork - ${new Date().toISOString()}] Fatal Error: Failed to load rustplus.proto:`, protoLoadError);
-            // Emit an error that the main application can catch
-            this.emit('error', new Error(`Failed to load protobuf definition: ${protoLoadError.message}`));
         });
 
+    }
+
+    /**
+     * Internal handler for WebSocket open event.
+     * @private
+     */
+    _handleOpen() {
+        console.log('INTERNAL: WebSocket connection opened and handled by _handleOpen.'); // Added for debugging
+        // Reset sequence number on new connection
+        this.seq = 0;
+        this.emit('connected');
     }
 
     /**
@@ -157,11 +166,14 @@ class RustPlus extends EventEmitter {
      */
     disconnect() {
         if(this.websocket){
-            console.log(`[RustPlus Fork - ${new Date().toISOString()}] Disconnect called. Terminating WebSocket.`); // Log disconnect call
-            this.websocket.terminate(); // Force close the connection
-            this.websocket = null; // Nullify the reference
-             // Clean up callbacks map on explicit disconnect
-             this.seqCallbacks = [];
+            console.log(`INTERNAL: Disconnecting WebSocket (readyState: ${this.websocket.readyState}).`);
+            // Don't emit 'disconnected' here, let the 'close' event handle it naturally
+            this.websocket.terminate(); // Force close
+            this.websocket = null; // Clear immediately
+            // Clear any pending callbacks that won't get a response
+            this.seqCallbacks = [];
+        } else {
+            console.log("INTERNAL: Disconnect called but no active WebSocket instance.");
         }
     }
 
@@ -170,33 +182,27 @@ class RustPlus extends EventEmitter {
      * @returns {boolean}
      */
     isConnected() {
-        // Ensure websocket exists before checking readyState
-        return this.websocket && (this.websocket.readyState === WebSocket.OPEN);
+        return (this.websocket && this.websocket.readyState === WebSocket.OPEN);
     }
-
 
     /**
      * Send a Request to the Rust Server with an optional callback when a Response is received.
      * @param data this should contain valid data for the AppRequest packet in the rustplus.proto schema file
-     * @param callback Optional callback for the response
+     * @param callback
      */
     sendRequest(data, callback) {
-        // Ensure websocket is ready before sending
+
+        // Check if connected before sending
         if (!this.isConnected()) {
-            const errorMsg = "Attempted to send request while not connected.";
-            console.error(`[RustPlus Fork - ${new Date().toISOString()}] ${errorMsg}`);
-            // If a callback was provided, call it immediately with an error?
+             console.error("INTERNAL: Attempted to send request while not connected.");
+             // Find and reject the callback if it exists, otherwise the promise might hang forever
              if (callback) {
-                 // Simulate an error response structure if possible, or just pass an Error
-                 try {
-                     callback({ response: { error: { error: 'disconnected' } } });
-                 } catch (cbError) {
-                     console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error invoking callback during disconnected sendRequest:`, cbError);
-                 }
-             }
-            // Emit a general error as well
-            this.emit('error', new Error(errorMsg));
-            return; // Stop processing
+                // Simulate an error response for the callback
+                callback({ response: { error: { error: "not_connected" } } });
+            }
+             // Or emit an error?
+             // this.emit('error', new Error("Attempted to send request while not connected."));
+            return;
         }
 
         // increment sequence number
@@ -208,40 +214,29 @@ class RustPlus extends EventEmitter {
         }
 
         // create protobuf from AppRequest packet
-        let requestPayload;
-        try {
-            requestPayload = this.AppRequest.fromObject({
-                seq: currentSeq,
-                playerId: this.playerId,
-                playerToken: this.playerToken,
-                ...data, // merge in provided data for AppRequest
-            });
-        } catch (objectError) {
-            console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error creating protobuf object:`, objectError, "Data:", data);
-            this.emit('error', new Error(`Protobuf object creation error: ${objectError.message}`));
-            if (callback) delete this.seqCallbacks[currentSeq]; // Clean up callback
-            return;
-        }
+        let request = this.AppRequest.fromObject({
+            seq: currentSeq,
+            playerId: this.playerId,
+            playerToken: this.playerToken,
+            ...data, // merge in provided data for AppRequest
+        });
 
-
-        // send AppRequest packet to rust server
         try {
-            const buffer = this.AppRequest.encode(requestPayload).finish();
-            this.websocket.send(buffer);
-             // fire event when request has been sent, this is useful for logging
-             // console.log(`[RustPlus Fork - ${new Date().toISOString()}] Sent request seq ${currentSeq}:`, JSON.stringify(requestPayload)); // Optional: Log sent request
-            this.emit('request', requestPayload);
+            // send AppRequest packet to rust server
+            this.websocket.send(this.AppRequest.encode(request).finish());
+
+            // fire event when request has been sent, this is useful for logging
+            this.emit('request', request);
         } catch (sendError) {
-            console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error sending WebSocket message seq ${currentSeq}:`, sendError);
-            // Handle the error, perhaps emit an error event
-            this.emit('error', new Error(`Failed to send request: ${sendError.message}`));
-             // If this request had a callback, maybe call it with an error?
-             // Or remove the callback if appropriate
-             if (this.seqCallbacks[currentSeq]) {
+             console.error("INTERNAL: Error sending WebSocket message:", sendError);
+             this.emit('error', sendError);
+             // Clean up callback if send fails
+            if (callback && this.seqCallbacks[currentSeq]) {
                  delete this.seqCallbacks[currentSeq];
-                 // Consider calling callback with an error object or similar
-             }
+            }
+             // Rethrow or handle? For now, log and emit.
         }
+
     }
 
     /**
@@ -251,225 +246,298 @@ class RustPlus extends EventEmitter {
      */
     sendRequestAsync(data, timeoutMilliseconds = 10000) {
         return new Promise((resolve, reject) => {
-             // Check connection status before attempting to send
+
+            // Check if connected before attempting to send
              if (!this.isConnected()) {
-                reject(new Error('Not connected to Rust server.'));
-                return;
+                  console.error("INTERNAL: Attempted sendRequestAsync while not connected.");
+                  return reject(new Error("Not connected to Rust server"));
              }
 
-             // Need to capture the sequence number *before* setting the timeout or sending
-             const currentSeq = ++this.seq;
-             let timeout = null; // Declare timeout variable
+            // Store the sequence number associated with this promise
+            let promiseSeq;
 
-             // Setup the callback first
-             this.seqCallbacks[currentSeq] = (message) => {
-                 clearTimeout(timeout); // Clear timeout on response
-                 // Callback removed by sendRequest logic after this runs or on timeout cleanup
-                 if (message.response.error) {
-                     reject(message.response.error);
-                 } else {
-                     resolve(message.response);
-                 }
-                 return true; // Mark as handled
-             };
-
-             // Setup the timeout
-             timeout = setTimeout(() => {
-                 // Ensure the callback for this sequence is cleaned up on timeout
-                 if (this.seqCallbacks[currentSeq]) {
-                     delete this.seqCallbacks[currentSeq];
-                 }
-                reject(new Error(`Timeout reached while waiting for response to seq ${currentSeq}`));
+            // Setup timeout *before* sending request
+            var timeout = setTimeout(() => {
+                 // Ensure we clean up the callback if timeout hits first
+                if (promiseSeq && this.seqCallbacks[promiseSeq]) {
+                     delete this.seqCallbacks[promiseSeq];
+                     console.log(`INTERNAL: Request ${promiseSeq} timed out.`);
+                }
+                reject(new Error('Timeout reached while waiting for response'));
             }, timeoutMilliseconds);
 
-            // Now actually send the request (using the manually incremented seq)
-            // Create protobuf from AppRequest packet (adjust internal seq handling)
-            let requestPayload;
-            try {
-                 requestPayload = this.AppRequest.fromObject({
-                    seq: currentSeq, // Use the captured sequence
-                    playerId: this.playerId,
-                    playerToken: this.playerToken,
-                    ...data,
-                });
-            } catch (objectError) {
-                console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error creating protobuf object for async req:`, objectError, "Data:", data);
-                 clearTimeout(timeout); // Clean up timer
-                if (this.seqCallbacks[currentSeq]) delete this.seqCallbacks[currentSeq]; // Clean up callback
-                reject(new Error(`Protobuf object creation error: ${objectError.message}`));
-                return;
-            }
+            // send request using the callback mechanism
+            this.sendRequest(data, (message) => {
+                 // If sendRequest failed immediately, the callback might still be called with an error
+                 // Or if not connected, it might have been called synchronously above.
 
-             // Send AppRequest packet
-             try {
-                 const buffer = this.AppRequest.encode(requestPayload).finish();
-                 this.websocket.send(buffer);
-                  // console.log(`[RustPlus Fork - ${new Date().toISOString()}] Sent async request seq ${currentSeq}:`, JSON.stringify(requestPayload)); // Optional log
-                 this.emit('request', requestPayload);
-             } catch (sendError) {
-                 console.error(`[RustPlus Fork - ${new Date().toISOString()}] Error sending async WebSocket message seq ${currentSeq}:`, sendError);
-                 clearTimeout(timeout); // Clean up timer
-                if (this.seqCallbacks[currentSeq]) delete this.seqCallbacks[currentSeq]; // Clean up callback
-                 this.emit('error', new Error(`Failed to send async request: ${sendError.message}`));
-                 reject(sendError); // Reject the promise
-             }
+                // Response received, clear the timeout
+                clearTimeout(timeout);
+
+                // Check for explicit AppError from the server response
+                if(message.response && message.response.error && message.response.error.error){
+                    console.warn(`INTERNAL: Request ${message.response.seq} failed with AppError: ${message.response.error.error}`);
+                    reject(message.response.error); // Reject with the AppError object
+                } else if (message.response) {
+                    // Request was successful (no AppError), resolve with message.response
+                    resolve(message.response);
+                } else {
+                     // This case should ideally not happen if sendRequest handles errors,
+                     // but as a fallback, reject if message.response is missing.
+                     console.error(`INTERNAL: Invalid response structure received for seq ${message.seq || 'unknown'}:`, message);
+                     reject(new Error("Invalid response structure received"));
+                }
+
+                // Return true to prevent the 'message' event from firing for this response
+                return true;
+            });
+
+            // Capture the sequence number assigned by sendRequest
+            // This assumes sendRequest assigns seq before returning if synchronous,
+            // or we rely on the callback logic to have the correct sequence.
+            // A safer way might be to have sendRequest return the seq number.
+            // For now, we rely on the callback having the correct message.seq.
+            // We store the seq *inside* the timeout closure for cleanup.
+            promiseSeq = this.seq; // Capture the latest seq number assigned
+
         });
     }
 
+    // --- Entity Methods ---
 
     /**
      * Send a Request to the Rust Server to set the Entity Value.
      * @param entityId the entity id to set the value for
      * @param value the value to set on the entity
-     * @param callback
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
     setEntityValue(entityId, value, callback) {
-        this.sendRequest({
-            entityId: entityId,
-            setEntityValue: {
-                value: value,
-            },
-        }, callback);
+         if (callback) {
+             console.warn("INTERNAL: setEntityValue callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 entityId: entityId,
+                 setEntityValue: {
+                     value: value,
+                 },
+             }, callback);
+             return Promise.resolve(); // Return dummy promise if callback used
+         } else {
+             return this.sendRequestAsync({
+                 entityId: entityId,
+                 setEntityValue: {
+                     value: value,
+                 },
+             });
+         }
     }
 
     /**
      * Turn a Smart Switch On
      * @param entityId the entity id of the smart switch to turn on
-     * @param callback
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
-    turnSmartSwitchOn(entityId, callback) {
-        this.setEntityValue(entityId, true, callback);
+    turnSmartSwitchOn(entityId) {
+        return this.setEntityValue(entityId, true);
     }
 
     /**
      * Turn a Smart Switch Off
      * @param entityId the entity id of the smart switch to turn off
-     * @param callback
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
-    turnSmartSwitchOff(entityId, callback) {
-        this.setEntityValue(entityId, false, callback);
-    }
-
-    /**
-     * Quickly turn on and off a Smart Switch as if it were a Strobe Light.
-     * You will get rate limited by the Rust Server after a short period.
-     * It was interesting to watch in game though 😝
-     */
-    strobe(entityId, timeoutMilliseconds = 100, value = true) {
-        this.setEntityValue(entityId, value);
-        setTimeout(() => {
-            // Check if connected before strobing again
-            if (this.isConnected()) {
-                 this.strobe(entityId, timeoutMilliseconds, !value);
-            }
-        }, timeoutMilliseconds);
-    }
-
-    /**
-     * Send a message to Team Chat
-     * @param message the message to send to team chat
-     * @param callback
-     */
-    sendTeamMessage(message, callback) {
-        this.sendRequest({
-            sendTeamMessage: {
-                message: message,
-            },
-        }, callback);
+    turnSmartSwitchOff(entityId) {
+        return this.setEntityValue(entityId, false);
     }
 
     /**
      * Get info for an Entity
      * @param entityId the id of the entity to get info of
-     * @param callback
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object containing entity info.
      */
     getEntityInfo(entityId, callback) {
-        this.sendRequest({
-            entityId: entityId,
-            getEntityInfo: {
-
-            },
-        }, callback);
+        if (callback) {
+             console.warn("INTERNAL: getEntityInfo callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 entityId: entityId,
+                 getEntityInfo: {},
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 entityId: entityId,
+                 getEntityInfo: {},
+             });
+        }
     }
 
+    // --- Team Methods ---
+
     /**
-     * Get the Map
+     * Send a message to Team Chat
+     * @param message the message to send to team chat
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
-    getMap(callback) {
-        this.sendRequest({
-            getMap: {
-
-            },
-        }, callback);
-    }
-
-    /**
-     * Get the ingame time
-    */
-    getTime(callback) {
-        this.sendRequest({
-            getTime: {
-
-            },
-        }, callback);
-    }
-
-    /**
-     * Get all map markers
-     */
-    getMapMarkers(callback) {
-        this.sendRequest({
-            getMapMarkers: {
-
-            },
-        }, callback);
-    }
-
-    /**
-     * Get the server info
-     */
-    getInfo(callback) {
-        this.sendRequest({
-            getInfo: {
-
-            },
-        }, callback);
+    sendTeamMessage(message, callback) {
+        if (callback) {
+             console.warn("INTERNAL: sendTeamMessage callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 sendTeamMessage: {
+                     message: message,
+                 },
+             }, callback);
+             return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 sendTeamMessage: {
+                     message: message,
+                 },
+             });
+        }
     }
 
     /**
      * Get team info
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object containing team info.
      */
     getTeamInfo(callback) {
-        this.sendRequest({
-            getTeamInfo: {
-
-            },
-        }, callback);
+         if (callback) {
+             console.warn("INTERNAL: getTeamInfo callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 getTeamInfo: {},
+             }, callback);
+             return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 getTeamInfo: {},
+             });
+        }
     }
+
+    // --- Map/Server Info Methods ---
+
+    /**
+     * Get the Map
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object containing map data.
+     */
+    getMap(callback) {
+        if (callback) {
+             console.warn("INTERNAL: getMap callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 getMap: {},
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 getMap: {},
+             });
+        }
+    }
+
+    /**
+     * Get the ingame time
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object containing time data.
+    */
+    getTime(callback) {
+        if (callback) {
+             console.warn("INTERNAL: getTime callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 getTime: {},
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 getTime: {},
+             });
+        }
+    }
+
+    /**
+     * Get all map markers
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object containing map markers.
+     */
+    getMapMarkers(callback) {
+        if (callback) {
+             console.warn("INTERNAL: getMapMarkers callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 getMapMarkers: {},
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 getMapMarkers: {},
+             });
+        }
+    }
+
+    /**
+     * Get the server info
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object containing server info.
+     */
+    getInfo(callback) {
+        if (callback) {
+             console.warn("INTERNAL: getInfo callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 getInfo: {},
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 getInfo: {},
+             });
+        }
+    }
+
+    // --- Camera Methods ---
 
     /**
      * Subscribes to a Camera
      * @param identifier Camera Identifier, such as OILRIG1 (or custom name)
-     * @param callback
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
     subscribeToCamera(identifier, callback) {
-        this.sendRequest({
-            cameraSubscribe: {
-                cameraId: identifier,
-            },
-        }, callback);
+         if (callback) {
+             console.warn("INTERNAL: subscribeToCamera callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 cameraSubscribe: {
+                     cameraId: identifier,
+                 },
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 cameraSubscribe: {
+                     cameraId: identifier,
+                 },
+             });
+        }
     }
 
     /**
      * Unsubscribes from a Camera
-     * @param callback
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
     unsubscribeFromCamera(callback) {
-        this.sendRequest({
-            cameraUnsubscribe: {
-
-            }
-        }, callback)
+        if (callback) {
+             console.warn("INTERNAL: unsubscribeFromCamera callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 cameraUnsubscribe: {},
+             }, callback)
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 cameraUnsubscribe: {},
+             });
+        }
     }
 
     /**
@@ -477,27 +545,65 @@ class RustPlus extends EventEmitter {
      * @param buttons The buttons that are currently pressed
      * @param x The x delta of the mouse movement
      * @param y The y delta of the mouse movement
-     * @param callback
+     * @param callback Deprecated: Use async version.
+     * @returns {Promise<object>} Promise resolving with the AppResponse object.
      */
     sendCameraInput(buttons, x, y, callback) {
-        this.sendRequest({
-            cameraInput: {
-                buttons: buttons,
-                mouseDelta: {
-                    x: x,
-                    y: y,
-                }
-            },
-        }, callback);
+        if (callback) {
+             console.warn("INTERNAL: sendCameraInput callback is deprecated. Use returned promise instead.");
+             this.sendRequest({
+                 cameraInput: {
+                     buttons: buttons,
+                     mouseDelta: {
+                         x: x,
+                         y: y,
+                     }
+                 },
+             }, callback);
+              return Promise.resolve();
+        } else {
+            return this.sendRequestAsync({
+                 cameraInput: {
+                     buttons: buttons,
+                     mouseDelta: {
+                         x: x,
+                         y: y,
+                     }
+                 },
+             });
+        }
     }
 
     /**
-     * Get a camera instance for controlling CCTV Cameras, PTZ Cameras and  Auto Turrets
+     * Get a camera instance for controlling CCTV Cameras, PTZ Cameras and Auto Turrets.
+     * Note: Ensure the Camera class is correctly defined and exported in './camera.js'.
      * @param identifier Camera Identifier, such as DOME1, OILRIG1L1, (or a custom camera id)
      * @returns {Camera}
      */
     getCamera(identifier) {
+        // Assuming Camera class handles its own connection state via the provided RustPlus instance
         return new Camera(this, identifier);
+    }
+
+    // --- Deprecated Strobe Method ---
+    /**
+     * Quickly turn on and off a Smart Switch as if it were a Strobe Light.
+     * You will get rate limited by the Rust Server after a short period.
+     * It was interesting to watch in game though 😝
+     * @deprecated Use manual timing with async methods if needed. Relies on setTimeout.
+     */
+    strobe(entityId, timeoutMilliseconds = 100, value = true) {
+        console.warn("INTERNAL: strobe method is deprecated and may lead to rate limiting.");
+        this.setEntityValue(entityId, value)
+            .then(() => {
+                 setTimeout(() => {
+                     this.strobe(entityId, timeoutMilliseconds, !value);
+                 }, timeoutMilliseconds);
+            })
+            .catch(err => {
+                console.error(`Error during strobe for entity ${entityId}:`, err);
+                // Stop strobing on error
+            });
     }
 
 }
